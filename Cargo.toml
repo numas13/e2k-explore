@@ -1,0 +1,20 @@
+[package]
+name = "e2k-explore"
+version = "0.1.0"
+authors = ["Denis Drakhnya <numas13@gmail.com>"]
+description = "Program to explore E2K ELF files."
+license = "GPL-3.0"
+repository = "https://github.com/numas13/e2k-explore"
+keywords = ["e2k", "elf", "binary"]
+edition = "2018"
+
+# TODO: tweak features
+[dependencies]
+xmas-elf = "0.7"
+clap = "2"
+anyhow = "1"
+regex = "1"
+e2k-arch = { git = "https://github.com/numas13/e2k-arch.git" }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+nix = "0.19"
