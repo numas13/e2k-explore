@@ -31,6 +31,12 @@ fn main() -> Result<()> {
     reset_signal_pipe_handler()?;
 
     let matches = app_from_crate!()
+        .arg(
+            Arg::with_name("force")
+                .short("f")
+                .long("force")
+                .help("Suppress machine type checkung"),
+        )
         .subcommand(
             SubCommand::with_name("dump")
                 .about("Dump ELF file")
@@ -57,6 +63,8 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
+    let is_forced = matches.is_present("force");
+
     if let ("dump", Some(matches)) = matches.subcommand() {
         let path = matches.value_of("file").unwrap_or("a.out");
         let filters: Vec<_> = matches
@@ -66,12 +74,14 @@ fn main() -> Result<()> {
         let vec = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
         let elf = ElfFile::new(&vec).map_err(Error::msg)?;
 
-        match elf.header.pt2 {
-            HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
-                Machine::Other(MACHINE_E2K_TYPE) => (),
-                _ => bail!("Unsupported machine type"),
-            },
-            HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
+        if !is_forced {
+            match elf.header.pt2 {
+                HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
+                    Machine::Other(MACHINE_E2K_TYPE) => (),
+                    _ => bail!("Unsupported machine type"),
+                },
+                HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
+            }
         }
 
         let dump = Dump {
