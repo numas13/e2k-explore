@@ -1,4 +1,4 @@
-use anyhow::{format_err, Context, Error, Result};
+use anyhow::{bail, format_err, Context, Error, Result};
 use clap::{
     app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg, SubCommand,
 };
@@ -6,10 +6,13 @@ use e2k_arch::raw::Bundle;
 use regex::RegexSet;
 use std::{env, fmt, fs};
 use xmas_elf::{
+    header::{HeaderPt2, Machine},
     sections::SectionData,
     symbol_table::{Entry, Type},
     ElfFile,
 };
+
+const MACHINE_E2K_TYPE: u16 = 0xaf;
 
 pub fn reset_signal_pipe_handler() -> Result<()> {
     #[cfg(target_family = "unix")]
@@ -62,6 +65,14 @@ fn main() -> Result<()> {
             .unwrap_or_default();
         let vec = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
         let elf = ElfFile::new(&vec).map_err(Error::msg)?;
+
+        match elf.header.pt2 {
+            HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
+                Machine::Other(MACHINE_E2K_TYPE) => (),
+                _ => bail!("Unsupported machine type"),
+            },
+            HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
+        }
 
         let dump = Dump {
             filters: RegexSet::new(&filters)?,
