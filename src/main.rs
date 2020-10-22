@@ -204,11 +204,9 @@ impl<'a> Dump<'a> {
                 println!("{: >11}{}{} {:02x}", "AAS", i / 2, i + 2, dst);
             }
         }
-        for i in (0..4).rev() {
-            match bundle.lts[i] {
-                Some(lts) => print_i("LTS", i, lts.0),
-                None => break,
-            }
+        let lts_count = bundle.get_max_lts_index().map_or(0, |i| i + 1) as usize;
+        for i in (0..lts_count).rev() {
+            print_i("LTS", i, bundle.lts[i].0);
         }
         for i in (0..bundle.hs.pls_len() as usize).rev() {
             print_i("PLS", i, bundle.pls[i].0);
