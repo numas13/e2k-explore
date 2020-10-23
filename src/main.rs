@@ -129,15 +129,16 @@ impl<'a> Dump<'a> {
         let section = entry
             .get_section_header(self.elf, entry.shndx() as usize)
             .map_err(Error::msg)?;
-        let vaddr = entry.value();
-        let paddr = vaddr - section.address();
-        println!("{:016x} {}:\n", vaddr, name);
+        let sec_offset = section.offset();
+        let offset = entry.value() - section.address();
+        let file_offset = sec_offset + offset;
+        println!("{:016x} {}:\n", file_offset, name);
         match section.get_data(self.elf) {
             Ok(SectionData::Undefined(data)) => {
-                let start = paddr as usize;
+                let start = offset as usize;
                 let end = start + entry.size() as usize;
                 let src = &data[start..end];
-                self.dump_slice(paddr, src)?;
+                self.dump_slice(file_offset, src)?;
             }
             Ok(_) => (),
             Err(e) => {
