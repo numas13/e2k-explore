@@ -56,6 +56,14 @@ fn main() -> Result<()> {
                         .possible_values(&["elf", "binary"]),
                 )
                 .arg(
+                    Arg::with_name("section")
+                        .short("x")
+                        .long("section")
+                        .help("Section name to dump")
+                        .takes_value(true)
+                        .conflicts_with("filter"),
+                )
+                .arg(
                     Arg::with_name("file")
                         .takes_value(true)
                         .help("File to explore"),
@@ -67,10 +75,6 @@ fn main() -> Result<()> {
 
     if let ("dump", Some(matches)) = matches.subcommand() {
         let path = matches.value_of("file").unwrap_or("a.out");
-        let filters: Vec<_> = matches
-            .values_of("filter")
-            .map(|i| i.collect())
-            .unwrap_or_default();
         let data = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
 
         let target = matches
@@ -78,9 +82,26 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| detect_file(&data));
 
         match target {
-            "elf" => dump_elf_file(forced, &data, &filters)?,
+            "elf" => {
+                let elf = match Object::parse(&data)? {
+                    Object::Elf(elf) => elf,
+                    _ => bail!("Unsupported file type"),
+                };
+                if !forced && elf.header.e_machine != MACHINE_E2K_TYPE {
+                    bail!("Unsupported machine type")
+                }
+                if let Some(name) = matches.value_of("section") {
+                    dump_elf_section(&data, &elf, name)?;
+                } else {
+                    let filters: Vec<_> = matches
+                        .values_of("filter")
+                        .map(|i| i.collect())
+                        .unwrap_or_default();
+                    DumpElfSyms::new(&filters, &data, &elf)?.dump_syms()?;
+                }
+            }
             "binary" => dump_slice(0, &data)?,
-            _ => println!(),
+            _ => unreachable!(),
         }
     }
 
@@ -96,30 +117,36 @@ fn detect_file(data: &[u8]) -> &'static str {
     }
 }
 
-fn dump_elf_file(forced: bool, data: &[u8], filters: &[&str]) -> Result<()> {
-    let elf = match Object::parse(data)? {
-        Object::Elf(elf) => elf,
-        _ => bail!("Unsupported file type"),
-    };
-    if !forced && elf.header.e_machine != MACHINE_E2K_TYPE {
-        bail!("Unsupported machine type")
-    }
-    DumpElf::new(filters, data, &elf)?.dump()
+fn dump_elf_section(data: &[u8], elf: &Elf, name: &str) -> Result<()> {
+    let sh = elf
+        .section_headers
+        .iter()
+        .find(|i| {
+            if i.sh_name != 0 {
+                &elf.shdr_strtab[i.sh_name] == name
+            } else {
+                false
+            }
+        })
+        .ok_or_else(|| format_err!("section {} not found", name))?;
+    let start = sh.sh_offset as usize;
+    let end = start + sh.sh_size as usize;
+    dump_slice(sh.sh_offset, &data[start..end])
 }
 
-struct DumpElf<'a> {
+struct DumpElfSyms<'a> {
     filters: RegexSet,
     data: &'a [u8],
     elf: &'a Elf<'a>,
 }
 
-impl<'a> DumpElf<'a> {
+impl<'a> DumpElfSyms<'a> {
     fn new(filters: &[&str], data: &'a [u8], elf: &'a Elf) -> Result<Self> {
         let filters = RegexSet::new(filters)?;
-        Ok(DumpElf { filters, data, elf })
+        Ok(DumpElfSyms { filters, data, elf })
     }
 
-    fn dump(&self) -> Result<()> {
+    fn dump_syms(&self) -> Result<()> {
         for i in self.elf.syms.iter() {
             let name = match i.st_name {
                 0 => None,
