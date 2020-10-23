@@ -2,9 +2,9 @@ use anyhow::{bail, format_err, Context, Error, Result};
 use clap::{
     app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg, SubCommand,
 };
-use e2k_arch::raw::Bundle;
+use e2k_arch::raw::{Bundle, Packed};
 use regex::RegexSet;
-use std::{env, fmt, fs};
+use std::{env, fs};
 use xmas_elf::{
     header::{HeaderPt2, Machine},
     sections::SectionData,
@@ -40,12 +40,6 @@ fn main() -> Result<()> {
         .subcommand(
             SubCommand::with_name("dump")
                 .about("Dump ELF file")
-                .arg(
-                    Arg::with_name("byte")
-                        .short("b")
-                        .long("byte")
-                        .help("Display syllables as a sequence of bytes"),
-                )
                 .arg(
                     Arg::with_name("filter")
                         .short("f")
@@ -86,7 +80,6 @@ fn main() -> Result<()> {
 
         let dump = Dump {
             filters: RegexSet::new(&filters)?,
-            is_byte: matches.is_present("byte"),
             elf: &elf,
         };
 
@@ -112,7 +105,6 @@ fn main() -> Result<()> {
 
 struct Dump<'a> {
     filters: RegexSet,
-    is_byte: bool,
     elf: &'a ElfFile<'a>,
 }
 
@@ -137,116 +129,170 @@ impl<'a> Dump<'a> {
         let section = entry
             .get_section_header(self.elf, entry.shndx() as usize)
             .map_err(Error::msg)?;
+        let vaddr = entry.value();
+        let paddr = vaddr - section.address();
+        println!("{:016x} {}:\n", vaddr, name);
         match section.get_data(self.elf) {
             Ok(SectionData::Undefined(data)) => {
-                println!("function {}\n", name);
-                let addr = (entry.value() - section.address()) as usize;
-                self.dump_slice(&data[addr..addr + entry.size() as usize])?;
-                println!();
+                let start = paddr as usize;
+                let end = start + entry.size() as usize;
+                let src = &data[start..end];
+                self.dump_slice(paddr, src)?;
             }
             Ok(_) => (),
             Err(e) => {
-                println!("function {}", name);
                 println!("failed to read section data, error {}\n", e);
             }
         }
         Ok(())
     }
 
-    fn dump_slice(&self, data: &[u8]) -> Result<()> {
+    fn dump_slice(&self, mut addr: u64, data: &[u8]) -> Result<()> {
         let mut cur = data;
         while !cur.is_empty() {
-            print!("  {:08x}", data.len() - cur.len());
-            match Bundle::from_slice(cur)
-                .map_err(|e| format_err!("failed to decode bundle, error: {}", e))
+            match Packed::from_slice(cur)
+                .map_err(|e| format_err!("failed to pre-decode bundle, error: {}", e))
             {
-                Ok((bundle, tail)) => {
-                    self.dump_bundle(&bundle);
-                    println!();
+                Ok((packed, tail)) => {
+                    let src = packed.as_slice();
+                    match Bundle::unpack(packed) {
+                        Ok(bundle) => self.dump_bundle(addr, src, &bundle),
+                        Err(e) => println!("failed to unpack bundle, error: {}", e),
+                    }
+                    addr += src.len() as u64;
                     cur = tail;
                 }
                 Err(e) => {
-                    println!("error: {}", e);
+                    print!("error: {}", e);
                     break;
                 }
             }
+            println!();
         }
         Ok(())
     }
 
-    fn dump_bundle(&self, bundle: &Bundle) {
-        let print = |s, n| println!("{: >15} {}", s, Value(self.is_byte, n));
-        let print_i = |s, i, n| println!("{: >14}{} {}", s, i, Value(self.is_byte, n));
+    fn dump_bundle(&self, addr: u64, src: &[u8], bundle: &Bundle) {
+        fn print_word(addr: u64, offset: &mut usize, src: &[u8]) {
+            let s = &src[*offset..*offset + 4];
+            print!(
+                "{:08x}  {:02x} {:02x} {:02x} {:02x} ",
+                addr + *offset as u64,
+                s[0],
+                s[1],
+                s[2],
+                s[3]
+            );
+            *offset += 4;
+        }
 
-        println!("{: >5} {}", "HS", Value(self.is_byte, bundle.hs.0));
+        let mut offset = 0;
+
+        print_word(addr, &mut offset, src);
+        println!("{: >6} {:08x}", "HS", bundle.hs.0);
         if bundle.hs.ss() {
-            print("SS", bundle.ss.0)
-        }
-        if bundle.hs.cs0() {
-            print("CS0", bundle.cs0.0)
-        }
-        if bundle.hs.cs1() {
-            print("CS1", bundle.cs1.0)
+            print_word(addr, &mut offset, src);
+            println!("{: >6} {:08x}", "SS", bundle.ss.0);
         }
         for i in 0..6 {
             if bundle.hs.als_mask() & 1 << i != 0 {
-                let als = Value(self.is_byte, bundle.als[i].0);
-                print!("{: >14}{} {}", "ALS", i, als);
-                if bundle.hs.ales_mask() & 1 << i != 0 {
-                    print!("    ALES{} ", i);
-                    if let Some(ales) = bundle.ales[i] {
-                        print!("{}", Value(self.is_byte, ales.0));
-                    } else {
-                        print!("bit");
-                    }
+                print_word(addr, &mut offset, src);
+                println!("{: >5}{} {:08x}", "ALS", i, bundle.als[i].0);
+            }
+        }
+        if bundle.hs.cs0() {
+            print_word(addr, &mut offset, src);
+            println!("{: >6} {:08x}", "CS0", bundle.cs0.0);
+        }
+        let offset_mid = bundle.hs.offset();
+        let offset_cs1 = bundle.hs.cs1() as usize * 4;
+        if offset + offset_cs1 < offset_mid {
+            print_word(addr, &mut offset, src);
+            let ales2 = bundle.ales[2].unwrap_or_default().0;
+            let ales5 = bundle.ales[5].unwrap_or_default().0;
+            println!(" ALES2 {:04x}     ALES5 {:04x}", ales2, ales5);
+        }
+        offset = offset_mid - 4;
+        if bundle.hs.cs1() {
+            print_word(addr, &mut offset, src);
+            println!("{: >6} {:08x}", "CS1", bundle.cs1.0);
+        } else {
+            offset += 4;
+        }
+
+        struct Helper<'a>(bool, &'a mut usize, &'a [u8]);
+        impl<'a> Helper<'a> {
+            fn print<F: FnMut()>(&mut self, addr: u64, mut f: F) {
+                if self.0 {
+                    print_word(addr, self.1, self.2);
+                    f();
+                } else {
+                    print!("    ");
+                    f();
+                    println!();
                 }
-                println!();
+                self.0 = !self.0;
+            }
+            fn finish(&self) {
+                if !self.0 {
+                    println!();
+                }
+            }
+        }
+        let mut helper = Helper(true, &mut offset, src);
+        for i in &[0, 1, 3, 4] {
+            if bundle.hs.ales_mask() & 1 << *i != 0 {
+                helper.print(addr, || {
+                    let ales = bundle.ales[*i].unwrap_or_default().0;
+                    print!(" {: >4}{} {:04x}", "ALES", i, ales)
+                });
+            }
+        }
+
+        for i in (0..4).step_by(2) {
+            if bundle.ss.aas_mask() & 3 << i != 0 {
+                helper.print(addr, || {
+                    print!(
+                        " {: >4}{} {:02x}{:02x}",
+                        "AAS",
+                        i / 2,
+                        bundle.aas_dst[i],
+                        bundle.aas_dst[i + 1],
+                    )
+                });
             }
         }
         for i in 0..4 {
             if bundle.ss.aas_mask() & 1 << i != 0 {
-                let aas = Value(self.is_byte, bundle.aas[i].0);
-                let dst = bundle.aas_dst[i];
-                print!("{: >14}{} {}", "AAS", i + 2, aas,);
-                if self.is_byte {
-                    print!("  ");
-                }
-                println!("{: >11}{}{} {:02x}", "AAS", i / 2, i + 2, dst);
+                helper.print(addr, || {
+                    print!(" {: >4}{} {:04x}", "AAS", i + 2, bundle.aas[i].0)
+                });
             }
         }
+        helper.finish();
+
+        // align
+        offset = (offset + 3) & !3;
         let lts_count = bundle.get_max_lts_index().map_or(0, |i| i + 1) as usize;
-        for i in (0..lts_count).rev() {
-            print_i("LTS", i, bundle.lts[i].0);
+        let pls_count = bundle.hs.pls_len() as usize;
+        let cds_count = bundle.hs.cds_len() as usize;
+        let tail_len = (lts_count + pls_count + cds_count) * 4;
+        while offset + tail_len < src.len() {
+            print_word(addr, &mut offset, src);
+            println!();
         }
-        for i in (0..bundle.hs.pls_len() as usize).rev() {
-            print_i("PLS", i, bundle.pls[i].0);
-        }
-        for i in (0..bundle.hs.cds_len() as usize).rev() {
-            print_i("CDS", i, bundle.cds[i].0);
-        }
-    }
-}
 
-struct Value<T>(bool, T);
-
-impl fmt::Display for Value<u32> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        if self.0 {
-            let b = self.1.to_le_bytes();
-            write!(fmt, "{:02x} {:02x} {:02x} {:02x}", b[0], b[1], b[2], b[3])
-        } else {
-            write!(fmt, "{:08x}", self.1)
+        for (i, lts) in bundle.lts.iter().take(lts_count).enumerate().rev() {
+            print_word(addr, &mut offset, src);
+            println!("{: >5}{} {:08x}", "LTS", i, lts.0);
         }
-    }
-}
-
-impl fmt::Display for Value<u16> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        if self.0 {
-            let b = self.1.to_le_bytes();
-            write!(fmt, "{:02x} {:02x}", b[0], b[1])
-        } else {
-            write!(fmt, "{:04x}", self.1)
+        for (i, pls) in bundle.pls.iter().take(pls_count).enumerate().rev() {
+            print_word(addr, &mut offset, src);
+            println!("{: >5}{} {:08x}", "PLS", i, pls.0);
+        }
+        for (i, cds) in bundle.cds.iter().take(cds_count).enumerate().rev() {
+            print_word(addr, &mut offset, src);
+            println!("{: >5}{} {:08x}", "CDS", i, cds.0);
         }
     }
 }
