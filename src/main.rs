@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         )
         .subcommand(
             SubCommand::with_name("dump")
-                .about("Dump ELF file")
+                .about("Dump ELF or binary file")
                 .arg(
                     Arg::with_name("filter")
                         .short("f")
@@ -50,6 +50,14 @@ fn main() -> Result<()> {
                         .help("Regex symbol filter"),
                 )
                 .arg(
+                    Arg::with_name("target")
+                        .short("t")
+                        .long("target")
+                        .help("File type")
+                        .takes_value(true)
+                        .possible_values(&["elf", "binary"]),
+                )
+                .arg(
                     Arg::with_name("file")
                         .takes_value(true)
                         .help("File to explore"),
@@ -57,7 +65,7 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let is_forced = matches.is_present("force");
+    let forced = matches.is_present("force");
 
     if let ("dump", Some(matches)) = matches.subcommand() {
         let path = matches.value_of("file").unwrap_or("a.out");
@@ -66,49 +74,72 @@ fn main() -> Result<()> {
             .map(|i| i.collect())
             .unwrap_or_default();
         let vec = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
-        let elf = ElfFile::new(&vec).map_err(Error::msg)?;
 
-        if !is_forced {
-            match elf.header.pt2 {
-                HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
-                    Machine::Other(MACHINE_E2K_TYPE) => (),
-                    _ => bail!("Unsupported machine type"),
-                },
-                HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
-            }
-        }
+        let target = matches
+            .value_of("target")
+            .unwrap_or_else(|| detect_file(&vec));
 
-        let dump = Dump {
-            filters: RegexSet::new(&filters)?,
-            elf: &elf,
-        };
-
-        for section in elf.section_iter() {
-            match section.get_data(&elf).map_err(Error::msg)? {
-                SectionData::SymbolTable64(entries) => {
-                    for entry in entries {
-                        dump.dump_entry(entry)?;
-                    }
-                }
-                SectionData::DynSymbolTable64(entries) => {
-                    for entry in entries {
-                        dump.dump_entry(entry)?;
-                    }
-                }
-                _ => (),
-            }
+        match target {
+            "elf" => dump_elf_file(forced, &vec, &filters)?,
+            "binary" => dump_slice(0, &vec)?,
+            _ => println!(),
         }
     }
 
     Ok(())
 }
 
-struct Dump<'a> {
+fn detect_file(vec: &[u8]) -> &'static str {
+    const ELF_MAGIC: &[u8] = &[0x7f, 0x45, 0x4c, 0x46];
+    if vec.len() > 4 && &vec[0..4] == ELF_MAGIC {
+        "elf"
+    } else {
+        "binary"
+    }
+}
+
+fn dump_elf_file(forced: bool, vec: &[u8], filters: &[&str]) -> Result<()> {
+    let elf = ElfFile::new(&vec).map_err(Error::msg)?;
+
+    if !forced {
+        match elf.header.pt2 {
+            HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
+                Machine::Other(MACHINE_E2K_TYPE) => (),
+                _ => bail!("Unsupported machine type"),
+            },
+            HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
+        }
+    }
+
+    let dump = DumpElf {
+        filters: RegexSet::new(filters)?,
+        elf: &elf,
+    };
+
+    for section in elf.section_iter() {
+        match section.get_data(&elf).map_err(Error::msg)? {
+            SectionData::SymbolTable64(entries) => {
+                for entry in entries {
+                    dump.dump_entry(entry)?;
+                }
+            }
+            SectionData::DynSymbolTable64(entries) => {
+                for entry in entries {
+                    dump.dump_entry(entry)?;
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
+struct DumpElf<'a> {
     filters: RegexSet,
     elf: &'a ElfFile<'a>,
 }
 
-impl<'a> Dump<'a> {
+impl<'a> DumpElf<'a> {
     fn dump_entry<E: Entry>(&self, entry: &E) -> Result<()> {
         if entry.shndx() > 0 {
             if let Ok(Type::Func) = entry.get_type() {
@@ -138,7 +169,7 @@ impl<'a> Dump<'a> {
                 let start = offset as usize;
                 let end = start + entry.size() as usize;
                 let src = &data[start..end];
-                self.dump_slice(file_offset, src)?;
+                dump_slice(file_offset, src)?;
             }
             Ok(_) => (),
             Err(e) => {
@@ -147,153 +178,184 @@ impl<'a> Dump<'a> {
         }
         Ok(())
     }
+}
 
-    fn dump_slice(&self, mut addr: u64, data: &[u8]) -> Result<()> {
-        let mut cur = data;
-        while !cur.is_empty() {
-            match Packed::from_slice(cur)
-                .map_err(|e| format_err!("failed to pre-decode bundle, error: {}", e))
-            {
-                Ok((packed, tail)) => {
-                    let src = packed.as_slice();
-                    match Bundle::unpack(packed) {
-                        Ok(bundle) => self.dump_bundle(addr, src, &bundle),
-                        Err(e) => println!("failed to unpack bundle, error: {}", e),
-                    }
-                    addr += src.len() as u64;
-                    cur = tail;
-                }
-                Err(e) => {
-                    print!("error: {}", e);
-                    break;
-                }
+fn dump_slice(mut addr: u64, data: &[u8]) -> Result<()> {
+    let mut cur = data;
+    while !cur.is_empty() {
+        match Packed::from_slice(cur)
+            .map_err(|e| format_err!("failed to pre-decode bundle, error: {}", e))
+        {
+            Ok((packed, tail)) => {
+                let src = packed.as_slice();
+                DumpBundle::new(addr, packed)?.dump();
+                addr += src.len() as u64;
+                cur = tail;
             }
-            println!();
+            Err(e) => {
+                print!("error: {}", e);
+                break;
+            }
         }
-        Ok(())
+        println!();
+    }
+    Ok(())
+}
+
+struct DumpSlice<'a> {
+    addr: u64,
+    src: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DumpSlice<'a> {
+    fn print_word(&mut self) {
+        let addr = self.addr + self.offset as u64;
+        let s = &self.src[self.offset..self.offset + 4];
+        print!(
+            "{:08x}  {:02x} {:02x} {:02x} {:02x} ",
+            addr, s[0], s[1], s[2], s[3]
+        );
+        self.offset += 4;
+    }
+}
+
+struct DumpBundle<'a> {
+    slice: DumpSlice<'a>,
+    bundle: Bundle,
+}
+
+impl<'a> DumpBundle<'a> {
+    fn new(addr: u64, packed: &'a Packed) -> Result<Self> {
+        let src = packed.as_slice();
+        let bundle = Bundle::unpack(packed)
+            .map_err(|e| format_err!("failed to unpack bundle, error: {}", e))?;
+        Ok(Self {
+            slice: DumpSlice {
+                addr,
+                src,
+                offset: 0,
+            },
+            bundle,
+        })
     }
 
-    fn dump_bundle(&self, addr: u64, src: &[u8], bundle: &Bundle) {
-        fn print_word(addr: u64, offset: &mut usize, src: &[u8]) {
-            let s = &src[*offset..*offset + 4];
-            print!(
-                "{:08x}  {:02x} {:02x} {:02x} {:02x} ",
-                addr + *offset as u64,
-                s[0],
-                s[1],
-                s[2],
-                s[3]
-            );
-            *offset += 4;
-        }
+    fn dump(self) {
+        let mut slice = self.slice;
+        let bundle = self.bundle;
 
-        let mut offset = 0;
-
-        print_word(addr, &mut offset, src);
+        let hs = bundle.hs;
+        let ss = bundle.ss;
+        slice.print_word();
         println!("{: >6} {:08x}", "HS", bundle.hs.0);
-        if bundle.hs.ss() {
-            print_word(addr, &mut offset, src);
+        if hs.ss() {
+            slice.print_word();
             println!("{: >6} {:08x}", "SS", bundle.ss.0);
         }
         for i in 0..6 {
-            if bundle.hs.als_mask() & 1 << i != 0 {
-                print_word(addr, &mut offset, src);
+            if hs.als_mask() & 1 << i != 0 {
+                slice.print_word();
                 println!("{: >5}{} {:08x}", "ALS", i, bundle.als[i].0);
             }
         }
-        if bundle.hs.cs0() {
-            print_word(addr, &mut offset, src);
+        if hs.cs0() {
+            slice.print_word();
             println!("{: >6} {:08x}", "CS0", bundle.cs0.0);
         }
-        let offset_mid = bundle.hs.offset();
-        let offset_cs1 = bundle.hs.cs1() as usize * 4;
-        if offset + offset_cs1 < offset_mid {
-            print_word(addr, &mut offset, src);
+        let offset_mid = hs.offset();
+        let offset_cs1 = hs.cs1() as usize * 4;
+        if slice.offset + offset_cs1 < offset_mid {
+            slice.print_word();
             let ales2 = bundle.ales[2].unwrap_or_default().0;
             let ales5 = bundle.ales[5].unwrap_or_default().0;
             println!(" ALES2 {:04x}     ALES5 {:04x}", ales2, ales5);
         }
-        offset = offset_mid - 4;
-        if bundle.hs.cs1() {
-            print_word(addr, &mut offset, src);
+        slice.offset = offset_mid - 4;
+        if hs.cs1() {
+            slice.print_word();
             println!("{: >6} {:08x}", "CS1", bundle.cs1.0);
         } else {
-            offset += 4;
+            slice.offset += 4;
         }
 
-        struct Helper<'a>(bool, &'a mut usize, &'a [u8]);
-        impl<'a> Helper<'a> {
-            fn print<F: FnMut()>(&mut self, addr: u64, mut f: F) {
-                if self.0 {
-                    print_word(addr, self.1, self.2);
-                    f();
-                } else {
-                    print!("    ");
-                    f();
-                    println!();
-                }
-                self.0 = !self.0;
-            }
-            fn finish(&self) {
-                if !self.0 {
-                    println!();
-                }
-            }
-        }
-        let mut helper = Helper(true, &mut offset, src);
+        let mut helper = DumpHelper::new(slice);
         for i in &[0, 1, 3, 4] {
-            if bundle.hs.ales_mask() & 1 << *i != 0 {
-                helper.print(addr, || {
-                    let ales = bundle.ales[*i].unwrap_or_default().0;
-                    print!(" {: >4}{} {:04x}", "ALES", i, ales)
-                });
+            if hs.ales_mask() & 1 << *i != 0 {
+                let ales = bundle.ales[*i].unwrap_or_default().0;
+                helper.print(|| print!(" {: >4}{} {:04x}", "ALES", i, ales));
             }
         }
 
         for i in (0..4).step_by(2) {
-            if bundle.ss.aas_mask() & 3 << i != 0 {
-                helper.print(addr, || {
-                    print!(
-                        " {: >4}{} {:02x}{:02x}",
-                        "AAS",
-                        i / 2,
-                        bundle.aas_dst[i],
-                        bundle.aas_dst[i + 1],
-                    )
-                });
+            if ss.aas_mask() & 3 << i != 0 {
+                let dst0 = bundle.aas_dst[i];
+                let dst1 = bundle.aas_dst[i + 1];
+                helper.print(|| print!(" {: >4}{} {:02x}{:02x}", "AAS", i / 2, dst0, dst1));
             }
         }
         for i in 0..4 {
-            if bundle.ss.aas_mask() & 1 << i != 0 {
-                helper.print(addr, || {
-                    print!(" {: >4}{} {:04x}", "AAS", i + 2, bundle.aas[i].0)
-                });
+            if ss.aas_mask() & 1 << i != 0 {
+                let aas = bundle.aas[i].0;
+                helper.print(|| print!(" {: >4}{} {:04x}", "AAS", i + 2, aas));
             }
         }
-        helper.finish();
+        let mut slice = helper.finish();
 
         // align
-        offset = (offset + 3) & !3;
+        slice.offset = (slice.offset + 3) & !3;
         let lts_count = bundle.get_max_lts_index().map_or(0, |i| i + 1) as usize;
-        let pls_count = bundle.hs.pls_len() as usize;
-        let cds_count = bundle.hs.cds_len() as usize;
+        let pls_count = hs.pls_len() as usize;
+        let cds_count = hs.cds_len() as usize;
         let tail_len = (lts_count + pls_count + cds_count) * 4;
-        while offset + tail_len < src.len() {
-            print_word(addr, &mut offset, src);
+        while slice.offset + tail_len < slice.src.len() {
+            slice.print_word();
             println!();
         }
 
         for (i, lts) in bundle.lts.iter().take(lts_count).enumerate().rev() {
-            print_word(addr, &mut offset, src);
+            slice.print_word();
             println!("{: >5}{} {:08x}", "LTS", i, lts.0);
         }
         for (i, pls) in bundle.pls.iter().take(pls_count).enumerate().rev() {
-            print_word(addr, &mut offset, src);
+            slice.print_word();
             println!("{: >5}{} {:08x}", "PLS", i, pls.0);
         }
         for (i, cds) in bundle.cds.iter().take(cds_count).enumerate().rev() {
-            print_word(addr, &mut offset, src);
+            slice.print_word();
             println!("{: >5}{} {:08x}", "CDS", i, cds.0);
         }
+    }
+}
+
+struct DumpHelper<'a> {
+    next_word: bool,
+    slice: DumpSlice<'a>,
+}
+
+impl<'a> DumpHelper<'a> {
+    fn new(slice: DumpSlice<'a>) -> Self {
+        Self {
+            next_word: true,
+            slice,
+        }
+    }
+
+    fn print<F: FnMut()>(&mut self, mut f: F) {
+        if self.next_word {
+            self.slice.print_word();
+            f();
+        } else {
+            print!("    ");
+            f();
+            println!();
+        }
+        self.next_word = !self.next_word;
+    }
+
+    fn finish(self) -> DumpSlice<'a> {
+        if !self.next_word {
+            println!();
+        }
+        self.slice
     }
 }
