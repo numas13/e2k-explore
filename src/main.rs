@@ -1,16 +1,14 @@
-use anyhow::{bail, format_err, Context, Error, Result};
+use anyhow::{bail, format_err, Context, Result};
 use clap::{
     app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg, SubCommand,
 };
 use e2k_arch::raw::{Bundle, Packed};
+use goblin::{
+    elf::{section_header::SHT_PROGBITS, Elf, Sym},
+    Object,
+};
 use regex::RegexSet;
 use std::{env, fs};
-use xmas_elf::{
-    header::{HeaderPt2, Machine},
-    sections::SectionData,
-    symbol_table::{Entry, Type},
-    ElfFile,
-};
 
 const MACHINE_E2K_TYPE: u16 = 0xaf;
 
@@ -73,15 +71,15 @@ fn main() -> Result<()> {
             .values_of("filter")
             .map(|i| i.collect())
             .unwrap_or_default();
-        let vec = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
+        let data = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
 
         let target = matches
             .value_of("target")
-            .unwrap_or_else(|| detect_file(&vec));
+            .unwrap_or_else(|| detect_file(&data));
 
         match target {
-            "elf" => dump_elf_file(forced, &vec, &filters)?,
-            "binary" => dump_slice(0, &vec)?,
+            "elf" => dump_elf_file(forced, &data, &filters)?,
+            "binary" => dump_slice(0, &data)?,
             _ => println!(),
         }
     }
@@ -89,94 +87,79 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn detect_file(vec: &[u8]) -> &'static str {
+fn detect_file(data: &[u8]) -> &'static str {
     const ELF_MAGIC: &[u8] = &[0x7f, 0x45, 0x4c, 0x46];
-    if vec.len() > 4 && &vec[0..4] == ELF_MAGIC {
+    if data.len() > 4 && &data[0..4] == ELF_MAGIC {
         "elf"
     } else {
         "binary"
     }
 }
 
-fn dump_elf_file(forced: bool, vec: &[u8], filters: &[&str]) -> Result<()> {
-    let elf = ElfFile::new(&vec).map_err(Error::msg)?;
-
-    if !forced {
-        match elf.header.pt2 {
-            HeaderPt2::Header64(pt2) => match pt2.machine.as_machine() {
-                Machine::Other(MACHINE_E2K_TYPE) => (),
-                _ => bail!("Unsupported machine type"),
-            },
-            HeaderPt2::Header32(_) => bail!("Unsupported ELF file"),
-        }
-    }
-
-    let dump = DumpElf {
-        filters: RegexSet::new(filters)?,
-        elf: &elf,
+fn dump_elf_file(forced: bool, data: &[u8], filters: &[&str]) -> Result<()> {
+    let elf = match Object::parse(data)? {
+        Object::Elf(elf) => elf,
+        _ => bail!("Unsupported file type"),
     };
-
-    for section in elf.section_iter() {
-        match section.get_data(&elf).map_err(Error::msg)? {
-            SectionData::SymbolTable64(entries) => {
-                for entry in entries {
-                    dump.dump_entry(entry)?;
-                }
-            }
-            SectionData::DynSymbolTable64(entries) => {
-                for entry in entries {
-                    dump.dump_entry(entry)?;
-                }
-            }
-            _ => (),
-        }
+    if !forced && elf.header.e_machine != MACHINE_E2K_TYPE {
+        bail!("Unsupported machine type")
     }
-    Ok(())
+    DumpElf::new(filters, data, &elf)?.dump()
 }
 
 struct DumpElf<'a> {
     filters: RegexSet,
-    elf: &'a ElfFile<'a>,
+    data: &'a [u8],
+    elf: &'a Elf<'a>,
 }
 
 impl<'a> DumpElf<'a> {
-    fn dump_entry<E: Entry>(&self, entry: &E) -> Result<()> {
-        if entry.shndx() > 0 {
-            if let Ok(Type::Func) = entry.get_type() {
-                if let Err(e) = self.dump_func(entry) {
-                    println!("error: {}", e);
-                }
-            }
-        }
+    fn new(filters: &[&str], data: &'a [u8], elf: &'a Elf) -> Result<Self> {
+        let filters = RegexSet::new(filters)?;
+        Ok(DumpElf { filters, data, elf })
+    }
 
+    fn dump(&self) -> Result<()> {
+        for i in self.elf.syms.iter() {
+            let name = match i.st_name {
+                0 => None,
+                _ => Some(&self.elf.strtab[i.st_name]),
+            };
+            self.dump_sym(name, i)?;
+        }
+        for i in self.elf.dynsyms.iter() {
+            let name = match i.st_name {
+                0 => None,
+                _ => Some(&self.elf.dynstrtab[i.st_name]),
+            };
+            self.dump_sym(name, i)?;
+        }
         Ok(())
     }
 
-    fn dump_func<E: Entry>(&self, entry: &E) -> Result<()> {
-        let name = entry.get_name(self.elf).map_err(Error::msg)?;
-        if !self.filters.is_empty() && !self.filters.is_match(name) {
+    fn dump_sym(&self, name: Option<&str>, entry: Sym) -> Result<()> {
+        if entry.st_shndx == 0
+            || !entry.is_function()
+            || (!self.filters.is_empty() && !name.map_or(true, |i| self.filters.is_match(i)))
+        {
             return Ok(());
         }
-        let section = entry
-            .get_section_header(self.elf, entry.shndx() as usize)
-            .map_err(Error::msg)?;
-        let sec_offset = section.offset();
-        let offset = entry.value() - section.address();
-        let file_offset = sec_offset + offset;
-        println!("{:016x} {}:\n", file_offset, name);
-        match section.get_data(self.elf) {
-            Ok(SectionData::Undefined(data)) => {
-                let start = offset as usize;
-                let end = start + entry.size() as usize;
-                let src = &data[start..end];
-                dump_slice(file_offset, src)?;
-            }
-            Ok(_) => (),
-            Err(e) => {
-                println!("failed to read section data, error {}\n", e);
-            }
+        let sh = match self.elf.section_headers.get(entry.st_shndx) {
+            Some(sh) => sh,
+            None => return Ok(()),
+        };
+        if sh.sh_type != SHT_PROGBITS {
+            return Ok(());
         }
-        Ok(())
+        let offset = sh.sh_offset + (entry.st_value - sh.sh_addr);
+        let start = offset as usize;
+        let end = start + entry.st_size as usize;
+        let src = &self.data[start..end];
+        match name {
+            Some(name) => println!("{:016x} {}:\n", offset, name),
+            None => println!("{:016x}:\n", offset),
+        }
+        dump_slice(offset, src)
     }
 }
 

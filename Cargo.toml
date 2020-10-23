@@ -10,7 +10,7 @@ edition = "2018"
 
 # TODO: tweak features
 [dependencies]
-xmas-elf = "0.7"
+goblin = "0.2.3"
 clap = "2"
 anyhow = "1"
 regex = "1"
