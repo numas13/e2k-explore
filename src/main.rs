@@ -2,7 +2,7 @@ use anyhow::{bail, format_err, Context, Result};
 use clap::{
     app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg, SubCommand,
 };
-use e2k_arch::raw::{Bundle, Packed};
+use e2k_arch::raw::{Packed, Unpacked};
 use goblin::{
     elf::{section_header::SHT_PROGBITS, Elf, Sym},
     Object,
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
             Arg::with_name("force")
                 .short("f")
                 .long("force")
-                .help("Suppress machine type checkung"),
+                .help("Suppress machine type checking"),
         )
         .subcommand(
             SubCommand::with_name("dump")
@@ -193,7 +193,7 @@ impl<'a> DumpElfSyms<'a> {
 fn dump_slice(mut addr: u64, data: &[u8]) -> Result<()> {
     let mut cur = data;
     while !cur.is_empty() {
-        match Packed::from_slice(cur)
+        match Packed::from_bytes(cur)
             .map_err(|e| format_err!("failed to pre-decode bundle, error: {}", e))
         {
             Ok((packed, tail)) => {
@@ -232,13 +232,13 @@ impl<'a> DumpSlice<'a> {
 
 struct DumpBundle<'a> {
     slice: DumpSlice<'a>,
-    bundle: Bundle,
+    bundle: Unpacked,
 }
 
 impl<'a> DumpBundle<'a> {
     fn new(addr: u64, packed: &'a Packed) -> Result<Self> {
         let src = packed.as_slice();
-        let bundle = Bundle::unpack(packed)
+        let bundle = Unpacked::unpack(packed)
             .map_err(|e| format_err!("failed to unpack bundle, error: {}", e))?;
         Ok(Self {
             slice: DumpSlice {
@@ -257,7 +257,8 @@ impl<'a> DumpBundle<'a> {
         let hs = bundle.hs;
         let ss = bundle.ss;
         slice.print_word();
-        println!("{: >6} {:08x}", "HS", bundle.hs.0);
+        print!("{: >6} {:08x}", "HS", bundle.hs.0);
+        println!();
         if hs.ss() {
             slice.print_word();
             println!("{: >6} {:08x}", "SS", bundle.ss.0);
@@ -265,7 +266,15 @@ impl<'a> DumpBundle<'a> {
         for i in 0..6 {
             if hs.als_mask() & 1 << i != 0 {
                 slice.print_word();
-                println!("{: >5}{} {:08x}", "ALS", i, bundle.als[i].0);
+                print!("{: >5}{} {:08x}", "ALS", i, bundle.als[i].0);
+                if !hs.is_ales25() {
+                    if i == 2 && hs.ales2() {
+                        print!(" ALES2 bit extension");
+                    } else if i == 5 && hs.ales5() {
+                        print!(" ALES5 bit extension");
+                    }
+                }
+                println!();
             }
         }
         if hs.cs0() {
