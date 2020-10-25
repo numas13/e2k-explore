@@ -322,7 +322,7 @@ impl<'a> DumpBundle<'a> {
 
         // align
         slice.offset = (slice.offset + 3) & !3;
-        let lts_count = bundle.get_max_lts_index().map_or(0, |i| i + 1) as usize;
+        let lts_count = bundle.lts_count;
         let pls_count = hs.pls_len() as usize;
         let cds_count = hs.cds_len() as usize;
         let tail_len = (lts_count + pls_count + cds_count) * 4;
