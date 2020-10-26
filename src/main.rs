@@ -3,6 +3,7 @@ use clap::{
     app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg, SubCommand,
 };
 use e2k_arch::raw::{Packed, Unpacked};
+use e2k_arch::Bundle;
 use goblin::{
     elf::{section_header::SHT_PROGBITS, Elf, Sym},
     Object,
@@ -64,6 +65,11 @@ fn main() -> Result<()> {
                         .conflicts_with("filter"),
                 )
                 .arg(
+                    Arg::with_name("disassemble")
+                        .long("disassemble")
+                        .help("Try to disassemble"),
+                )
+                .arg(
                     Arg::with_name("file")
                         .takes_value(true)
                         .help("File to explore"),
@@ -74,6 +80,7 @@ fn main() -> Result<()> {
     let forced = matches.is_present("force");
 
     if let ("dump", Some(matches)) = matches.subcommand() {
+        let disassemble = matches.is_present("disassemble");
         let path = matches.value_of("file").unwrap_or("a.out");
         let data = fs::read(&path).with_context(|| format_err!("failed to read file {}", path))?;
 
@@ -91,16 +98,16 @@ fn main() -> Result<()> {
                     bail!("Unsupported machine type")
                 }
                 if let Some(name) = matches.value_of("section") {
-                    dump_elf_section(&data, &elf, name)?;
+                    dump_elf_section(disassemble, &data, &elf, name)?;
                 } else {
                     let filters: Vec<_> = matches
                         .values_of("filter")
                         .map(|i| i.collect())
                         .unwrap_or_default();
-                    DumpElfSyms::new(&filters, &data, &elf)?.dump_syms()?;
+                    DumpElfSyms::new(disassemble, &filters, &data, &elf)?.dump_syms()?;
                 }
             }
-            "binary" => dump_slice(0, &data)?,
+            "binary" => dump_slice(disassemble, 0, &data)?,
             _ => unreachable!(),
         }
     }
@@ -117,7 +124,7 @@ fn detect_file(data: &[u8]) -> &'static str {
     }
 }
 
-fn dump_elf_section(data: &[u8], elf: &Elf, name: &str) -> Result<()> {
+fn dump_elf_section(disassemble: bool, data: &[u8], elf: &Elf, name: &str) -> Result<()> {
     let sh = elf
         .section_headers
         .iter()
@@ -131,19 +138,25 @@ fn dump_elf_section(data: &[u8], elf: &Elf, name: &str) -> Result<()> {
         .ok_or_else(|| format_err!("section {} not found", name))?;
     let start = sh.sh_offset as usize;
     let end = start + sh.sh_size as usize;
-    dump_slice(sh.sh_offset, &data[start..end])
+    dump_slice(disassemble, sh.sh_offset, &data[start..end])
 }
 
 struct DumpElfSyms<'a> {
+    disassemble: bool,
     filters: RegexSet,
     data: &'a [u8],
     elf: &'a Elf<'a>,
 }
 
 impl<'a> DumpElfSyms<'a> {
-    fn new(filters: &[&str], data: &'a [u8], elf: &'a Elf) -> Result<Self> {
+    fn new(disassemble: bool, filters: &[&str], data: &'a [u8], elf: &'a Elf) -> Result<Self> {
         let filters = RegexSet::new(filters)?;
-        Ok(DumpElfSyms { filters, data, elf })
+        Ok(DumpElfSyms {
+            disassemble,
+            filters,
+            data,
+            elf,
+        })
     }
 
     fn dump_syms(&self) -> Result<()> {
@@ -186,11 +199,11 @@ impl<'a> DumpElfSyms<'a> {
             Some(name) => println!("{:016x} {}:\n", offset, name),
             None => println!("{:016x}:\n", offset),
         }
-        dump_slice(offset, src)
+        dump_slice(self.disassemble, offset, src)
     }
 }
 
-fn dump_slice(mut addr: u64, data: &[u8]) -> Result<()> {
+fn dump_slice(disassemble: bool, mut addr: u64, data: &[u8]) -> Result<()> {
     let mut cur = data;
     while !cur.is_empty() {
         match Packed::from_bytes(cur)
@@ -198,7 +211,7 @@ fn dump_slice(mut addr: u64, data: &[u8]) -> Result<()> {
         {
             Ok((packed, tail)) => {
                 let src = packed.as_slice();
-                DumpBundle::new(addr, packed)?.dump();
+                DumpBundle::new(disassemble, addr, packed)?.dump();
                 addr += src.len() as u64;
                 cur = tail;
             }
@@ -231,42 +244,49 @@ impl<'a> DumpSlice<'a> {
 }
 
 struct DumpBundle<'a> {
+    disassemble: bool,
     slice: DumpSlice<'a>,
-    bundle: Unpacked,
+    raw: Unpacked,
 }
 
 impl<'a> DumpBundle<'a> {
-    fn new(addr: u64, packed: &'a Packed) -> Result<Self> {
+    fn new(disassemble: bool, addr: u64, packed: &'a Packed) -> Result<Self> {
         let src = packed.as_slice();
-        let bundle = Unpacked::unpack(packed)
+        let raw = Unpacked::unpack(packed)
             .map_err(|e| format_err!("failed to unpack bundle, error: {}", e))?;
         Ok(Self {
+            disassemble,
             slice: DumpSlice {
                 addr,
                 src,
                 offset: 0,
             },
-            bundle,
+            raw,
         })
     }
 
     fn dump(self) {
         let mut slice = self.slice;
-        let bundle = self.bundle;
-
-        let hs = bundle.hs;
-        let ss = bundle.ss;
+        let raw = self.raw;
+        if self.disassemble {
+            match Bundle::from_unpacked(&raw) {
+                Ok(bundle) => println!("{}", bundle),
+                Err(e) => println!("failed to disassemble: {:?}", e),
+            };
+        }
+        let hs = raw.hs;
+        let ss = raw.ss;
         slice.print_word();
-        print!("{: >6} {:08x}", "HS", bundle.hs.0);
+        print!("{: >6} {:08x}", "HS", raw.hs.0);
         println!();
         if hs.ss() {
             slice.print_word();
-            println!("{: >6} {:08x}", "SS", bundle.ss.0);
+            println!("{: >6} {:08x}", "SS", raw.ss.0);
         }
         for i in 0..6 {
             if hs.als_mask() & 1 << i != 0 {
                 slice.print_word();
-                print!("{: >5}{} {:08x}", "ALS", i, bundle.als[i].0);
+                print!("{: >5}{} {:08x}", "ALS", i, raw.als[i].0);
                 if !hs.is_ales25() {
                     if i == 2 && hs.ales2() {
                         print!(" ALES2 bit extension");
@@ -279,20 +299,20 @@ impl<'a> DumpBundle<'a> {
         }
         if hs.cs0() {
             slice.print_word();
-            println!("{: >6} {:08x}", "CS0", bundle.cs0.0);
+            println!("{: >6} {:08x}", "CS0", raw.cs0.0);
         }
         let offset_mid = hs.offset();
         let offset_cs1 = hs.cs1() as usize * 4;
         if slice.offset + offset_cs1 < offset_mid {
             slice.print_word();
-            let ales2 = bundle.ales[2].unwrap_or_default().0;
-            let ales5 = bundle.ales[5].unwrap_or_default().0;
+            let ales2 = raw.ales[2].unwrap_or_default().0;
+            let ales5 = raw.ales[5].unwrap_or_default().0;
             println!(" ALES2 {:04x}     ALES5 {:04x}", ales2, ales5);
         }
         slice.offset = offset_mid - 4;
         if hs.cs1() {
             slice.print_word();
-            println!("{: >6} {:08x}", "CS1", bundle.cs1.0);
+            println!("{: >6} {:08x}", "CS1", raw.cs1.0);
         } else {
             slice.offset += 4;
         }
@@ -300,21 +320,21 @@ impl<'a> DumpBundle<'a> {
         let mut helper = DumpHelper::new(slice);
         for i in &[0, 1, 3, 4] {
             if hs.ales_mask() & 1 << *i != 0 {
-                let ales = bundle.ales[*i].unwrap_or_default().0;
+                let ales = raw.ales[*i].unwrap_or_default().0;
                 helper.print(|| print!(" {: >4}{} {:04x}", "ALES", i, ales));
             }
         }
 
         for i in (0..4).step_by(2) {
             if ss.aas_mask() & 3 << i != 0 {
-                let dst0 = bundle.aas_dst[i];
-                let dst1 = bundle.aas_dst[i + 1];
+                let dst0 = raw.aas_dst[i];
+                let dst1 = raw.aas_dst[i + 1];
                 helper.print(|| print!(" {: >4}{} {:02x}{:02x}", "AAS", i / 2, dst0, dst1));
             }
         }
         for i in 0..4 {
             if ss.aas_mask() & 1 << i != 0 {
-                let aas = bundle.aas[i].0;
+                let aas = raw.aas[i].0;
                 helper.print(|| print!(" {: >4}{} {:04x}", "AAS", i + 2, aas));
             }
         }
@@ -322,7 +342,7 @@ impl<'a> DumpBundle<'a> {
 
         // align
         slice.offset = (slice.offset + 3) & !3;
-        let lts_count = bundle.lts_count;
+        let lts_count = raw.lts_count;
         let pls_count = hs.pls_len() as usize;
         let cds_count = hs.cds_len() as usize;
         let tail_len = (lts_count + pls_count + cds_count) * 4;
@@ -331,17 +351,17 @@ impl<'a> DumpBundle<'a> {
             println!();
         }
 
-        for (i, lts) in bundle.lts.iter().take(lts_count).enumerate().rev() {
+        for (i, lts) in raw.lts.iter().take(lts_count).enumerate().rev() {
             slice.print_word();
             println!("{: >5}{} {:08x}", "LTS", i, lts.0);
         }
-        for (i, pls) in bundle.pls.iter().take(pls_count).enumerate().rev() {
+        for (i, pls) in raw.pls.iter().take(pls_count).enumerate().rev() {
             slice.print_word();
             println!("{: >5}{} {:08x}", "PLS", i, pls.0);
         }
-        for (i, cds) in bundle.cds.iter().take(cds_count).enumerate().rev() {
+        for (i, cds) in raw.cds.iter().take(cds_count).enumerate().rev() {
             slice.print_word();
-            println!("{: >5}{} {:08x}", "CDS", i, cds.0);
+            println!("{: >5}{} {:08x}", "CDS", i, cds.into_raw());
         }
     }
 }
