@@ -305,8 +305,8 @@ impl<'a> DumpBundle<'a> {
         let offset_cs1 = hs.cs1() as usize * 4;
         if slice.offset + offset_cs1 < offset_mid {
             slice.print_word();
-            let ales2 = raw.ales[2].unwrap_or_default().0;
-            let ales5 = raw.ales[5].unwrap_or_default().0;
+            let ales2 = raw.ales[2].0;
+            let ales5 = raw.ales[5].0;
             println!(" ALES2 {:04x}     ALES5 {:04x}", ales2, ales5);
         }
         slice.offset = offset_mid - 4;
@@ -320,7 +320,7 @@ impl<'a> DumpBundle<'a> {
         let mut helper = DumpHelper::new(slice);
         for i in &[0, 1, 3, 4] {
             if hs.ales_mask() & 1 << *i != 0 {
-                let ales = raw.ales[*i].unwrap_or_default().0;
+                let ales = raw.ales[*i].0;
                 helper.print(|| print!(" {: >4}{} {:04x}", "ALES", i, ales));
             }
         }
