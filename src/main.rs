@@ -9,6 +9,7 @@ use goblin::{
     Object,
 };
 use regex::RegexSet;
+use std::error::Error;
 use std::{env, fs};
 
 const MACHINE_E2K_TYPE: u16 = 0xaf;
@@ -271,8 +272,15 @@ impl<'a> DumpBundle<'a> {
         if self.disassemble {
             match Bundle::from_unpacked(u8::MAX, &raw) {
                 Ok(bundle) => println!("{}", bundle),
-                Err(e) => println!("failed to disassemble: {:?}", e),
-            };
+                Err(e) => {
+                    eprintln!("[ERROR]: {}", e);
+                    eprintln!("Caused by:");
+                    for (i, e) in std::iter::successors(e.source(), |e| e.source()).enumerate() {
+                        eprintln!("  {}: {}", i, e);
+                    }
+                    eprintln!();
+                }
+            }
         }
         let hs = raw.hs;
         let ss = raw.ss;
