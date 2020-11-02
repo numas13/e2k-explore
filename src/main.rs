@@ -269,7 +269,7 @@ impl<'a> DumpBundle<'a> {
         let mut slice = self.slice;
         let raw = self.raw;
         if self.disassemble {
-            match Bundle::from_unpacked(&raw) {
+            match Bundle::from_unpacked(u8::MAX, &raw) {
                 Ok(bundle) => println!("{}", bundle),
                 Err(e) => println!("failed to disassemble: {:?}", e),
             };
@@ -342,7 +342,7 @@ impl<'a> DumpBundle<'a> {
 
         // align
         slice.offset = (slice.offset + 3) & !3;
-        let lts_count = raw.lts_count;
+        let lts_count = raw.lts_count();
         let pls_count = hs.pls_len() as usize;
         let cds_count = hs.cds_len() as usize;
         let tail_len = (lts_count + pls_count + cds_count) * 4;
@@ -353,7 +353,7 @@ impl<'a> DumpBundle<'a> {
 
         for (i, lts) in raw.lts.iter().take(lts_count).enumerate().rev() {
             slice.print_word();
-            println!("{: >5}{} {:08x}", "LTS", i, lts.0);
+            println!("{: >5}{} {:08x}", "LTS", i, lts.unwrap());
         }
         for (i, pls) in raw.pls.iter().take(pls_count).enumerate().rev() {
             slice.print_word();
